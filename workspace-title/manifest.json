@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "cyrus.workspace-title",
+  "name": "Workspace title",
+  "version": "1.0.0",
+  "author": "cyrus",
+  "description": "Click-to-rename label for the active workspace",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Workspace title",
+    "description": "Click-to-rename label for the active workspace",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": {
+      "maxWidth": 240
+    }
+  }
+}
