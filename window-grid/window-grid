@@ -1,0 +1,76 @@
+#!/bin/bash
+# Toggle the windows on the active workspace between a grid and normal tiling.
+#
+# Grid: every window is floated and placed in an even grid sized to the window
+# count (2 side by side, 3-4 in 2x2, 5-6 in 3x2, 7-9 in 3x3, ...). A short last
+# row stretches to fill the width. Windows keep their reading order (top to
+# bottom, left to right). Gaps, borders and the bar's reserved space match
+# Hyprland's own tiling, so the grid lines up with the rest of the desktop.
+#
+# Run it again and the gridded windows go back to tiling.
+
+set -euo pipefail
+
+dispatch() {
+  hyprctl dispatch "$1" >/dev/null
+}
+
+ws=$(hyprctl activeworkspace -j | jq '.id')
+clients=$(hyprctl clients -j | jq --argjson ws "$ws" \
+  '[.[] | select(.workspace.id == $ws and .mapped and (.hidden | not) and (.pinned | not))]
+   | sort_by(.at[1], .at[0])')
+count=$(jq 'length' <<<"$clients")
+((count > 0)) || exit 0
+
+# Already gridded (every window carries the tag): restore tiling.
+if jq -e 'all(.[]; (.tags // []) | any(. == "grid" or . == "grid*"))' <<<"$clients" >/dev/null; then
+  for addr in $(jq -r '.[].address' <<<"$clients"); do
+    dispatch "hl.dsp.window.float({ window = \"address:$addr\", action = \"off\" })"
+    dispatch "hl.dsp.window.tag({ window = \"address:$addr\", tag = \"-grid\" })"
+  done
+  exit 0
+fi
+
+opt_first() { hyprctl getoption "$1" -j | jq -r '(.css // (.int|tostring)) | split(" ")[0] | tonumber'; }
+gaps_in=$(opt_first general:gaps_in)
+gaps_out=$(opt_first general:gaps_out)
+border=$(opt_first general:border_size)
+
+mon=$(hyprctl monitors -j | jq --argjson ws "$ws" '.[] | select(.activeWorkspace.id == $ws)')
+read -r mx my mw mh rl rt rr rb < <(jq -r '
+  (if (.transform % 2) == 1 then [.height, .width] else [.width, .height] end) as $size
+  | [.x, .y, ($size[0] / .scale | floor), ($size[1] / .scale | floor)] + .reserved | @tsv' <<<"$mon")
+
+# Usable area, then the grid shape.
+ax=$((mx + rl + gaps_out))
+ay=$((my + rt + gaps_out))
+aw=$((mw - rl - rr - 2 * gaps_out))
+ah=$((mh - rt - rb - 2 * gaps_out))
+between=$((2 * gaps_in))
+
+cols=1
+while ((cols * cols < count)); do cols=$((cols + 1)); done
+rows=$(((count + cols - 1) / cols))
+cell_h=$(((ah - (rows - 1) * between) / rows))
+
+i=0
+for addr in $(jq -r '.[].address' <<<"$clients"); do
+  row=$((i / cols))
+  col=$((i % cols))
+  # The last row may be short; its windows share the full width.
+  in_row=$cols
+  if ((row == rows - 1)); then in_row=$((count - row * cols)); fi
+  cell_w=$(((aw - (in_row - 1) * between) / in_row))
+
+  x=$((ax + col * (cell_w + between) + border))
+  y=$((ay + row * (cell_h + between) + border))
+  w=$((cell_w - 2 * border))
+  h=$((cell_h - 2 * border))
+
+  win="address:$addr"
+  dispatch "hl.dsp.window.float({ window = \"$win\", action = \"on\" })"
+  dispatch "hl.dsp.window.resize({ window = \"$win\", x = $w, y = $h })"
+  dispatch "hl.dsp.window.move({ window = \"$win\", x = $x, y = $y })"
+  dispatch "hl.dsp.window.tag({ window = \"$win\", tag = \"+grid\" })"
+  i=$((i + 1))
+done
