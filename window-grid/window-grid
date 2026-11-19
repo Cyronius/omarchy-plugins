@@ -1,76 +1,133 @@
-#!/bin/bash
-# Toggle the windows on the active workspace between a grid and normal tiling.
-#
-# Grid: every window is floated and placed in an even grid sized to the window
-# count (2 side by side, 3-4 in 2x2, 5-6 in 3x2, 7-9 in 3x3, ...). A short last
-# row stretches to fill the width. Windows keep their reading order (top to
-# bottom, left to right). Gaps, borders and the bar's reserved space match
-# Hyprland's own tiling, so the grid lines up with the rest of the desktop.
-#
-# Run it again and the gridded windows go back to tiling.
+#!/usr/bin/env python3
+"""Rebuild the focused workspace as a grid of native Dwindle splits."""
 
-set -euo pipefail
+import json
+from math import isqrt
+import os
+from pathlib import Path
+import re
+import subprocess
+import uuid
 
-dispatch() {
-  hyprctl dispatch "$1" >/dev/null
-}
 
-ws=$(hyprctl activeworkspace -j | jq '.id')
-clients=$(hyprctl clients -j | jq --argjson ws "$ws" \
-  '[.[] | select(.workspace.id == $ws and .mapped and (.hidden | not) and (.pinned | not))]
-   | sort_by(.at[1], .at[0])')
-count=$(jq 'length' <<<"$clients")
-((count > 0)) || exit 0
+def hypr(*args):
+    return subprocess.check_output(("hyprctl", *args), text=True).strip()
 
-# Already gridded (every window carries the tag): restore tiling.
-if jq -e 'all(.[]; (.tags // []) | any(. == "grid" or . == "grid*"))' <<<"$clients" >/dev/null; then
-  for addr in $(jq -r '.[].address' <<<"$clients"); do
-    dispatch "hl.dsp.window.float({ window = \"address:$addr\", action = \"off\" })"
-    dispatch "hl.dsp.window.tag({ window = \"address:$addr\", tag = \"-grid\" })"
-  done
-  exit 0
-fi
 
-opt_first() { hyprctl getoption "$1" -j | jq -r '(.css // (.int|tostring)) | split(" ")[0] | tonumber'; }
-gaps_in=$(opt_first general:gaps_in)
-gaps_out=$(opt_first general:gaps_out)
-border=$(opt_first general:border_size)
+def dispatch(action):
+    result = hypr("dispatch", action)
+    if result != "ok":
+        raise RuntimeError(result)
 
-mon=$(hyprctl monitors -j | jq --argjson ws "$ws" '.[] | select(.activeWorkspace.id == $ws)')
-read -r mx my mw mh rl rt rr rb < <(jq -r '
-  (if (.transform % 2) == 1 then [.height, .width] else [.width, .height] end) as $size
-  | [.x, .y, ($size[0] / .scale | floor), ($size[1] / .scale | floor)] + .reserved | @tsv' <<<"$mon")
 
-# Usable area, then the grid shape.
-ax=$((mx + rl + gaps_out))
-ay=$((my + rt + gaps_out))
-aw=$((mw - rl - rr - 2 * gaps_out))
-ah=$((mh - rt - rb - 2 * gaps_out))
-between=$((2 * gaps_in))
+def layout(message):
+    dispatch(f"hl.dsp.layout({json.dumps(message)})")
 
-cols=1
-while ((cols * cols < count)); do cols=$((cols + 1)); done
-rows=$(((count + cols - 1) / cols))
-cell_h=$(((ah - (rows - 1) * between) / rows))
 
-i=0
-for addr in $(jq -r '.[].address' <<<"$clients"); do
-  row=$((i / cols))
-  col=$((i % cols))
-  # The last row may be short; its windows share the full width.
-  in_row=$cols
-  if ((row == rows - 1)); then in_row=$((count - row * cols)); fi
-  cell_w=$(((aw - (in_row - 1) * between) / in_row))
+def selector(address):
+    return json.dumps(f"address:{address}")
 
-  x=$((ax + col * (cell_w + between) + border))
-  y=$((ay + row * (cell_h + between) + border))
-  w=$((cell_w - 2 * border))
-  h=$((cell_h - 2 * border))
 
-  win="address:$addr"
-  dispatch "hl.dsp.window.float({ window = \"$win\", action = \"on\" })"
-  dispatch "hl.dsp.window.resize({ window = \"$win\", x = $w, y = $h })"
-  dispatch "hl.dsp.window.move({ window = \"$win\", x = $x, y = $y })"
-  dispatch "hl.dsp.window.tag({ window = \"$win\", tag = \"+grid\" })"
-  i=$((i + 1))
-done
+def focus(address):
+    dispatch(f"hl.dsp.focus({{ window = {selector(address)} }})")
+
+
+def move(address, workspace):
+    dispatch(
+        f"hl.dsp.window.move({{ window = {selector(address)}, "
+        f"workspace = {json.dumps(workspace)}, follow = false }})"
+    )
+
+
+def tile(workspace, windows):
+    target = workspace["name"]
+    if not target.isdecimal():
+        target = "name:" + target
+    mode = f"o.workspace_mode({{ workspace = {json.dumps(target)}, mode = \"dwindle\" }})"
+    hypr("eval", mode)
+    if json.loads(hypr("-j", "activeworkspace"))["tiledLayout"] != "dwindle":
+        raise RuntimeError("Could not switch the workspace to Dwindle")
+    if workspace["id"] > 0:
+        state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+        modes = state / "omarchy/workspace-layouts"
+        modes.mkdir(parents=True, exist_ok=True)
+        saved = modes / f'{workspace["id"]}.lua'
+        temporary = saved.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(mode + "\n")
+        temporary.replace(saved)
+
+    for window in windows:
+        address = window["address"]
+        dispatch(f"hl.dsp.window.float({{ window = {selector(address)}, action = \"off\" }})")
+        if any(tag.rstrip("*") == "grid" for tag in window.get("tags", [])):
+            dispatch(f"hl.dsp.window.tag({{ window = {selector(address)}, tag = \"-grid\" }})")
+    if len(windows) == 1:
+        return
+
+    addresses = [window["address"] for window in windows]
+    focused = workspace.get("lastwindow")
+    staging = f"special:window-grid-{uuid.uuid4().hex}"
+    pending = set()
+
+    def place(items, direction):
+        """Split the anchor, then independently subdivide its two children."""
+        if len(items) < 2:
+            return
+        middle = (len(items) + 1) // 2
+        first, second = items[:middle], items[middle:]
+        focus(first[0])
+        layout(f"preselect {direction}")
+        move(second[0], target)
+        pending.remove(second[0])
+        focus(second[0])
+        layout(f"splitratio {2 * middle / len(items):.6f} exact")
+        place(first, direction)
+        place(second, direction)
+
+    try:
+        # Leave the first tile in place so the focused workspace stays active.
+        for address in addresses[1:]:
+            move(address, staging)
+            pending.add(address)
+        columns = isqrt(len(addresses) - 1) + 1
+        rows = [addresses[index:index + columns] for index in range(0, len(addresses), columns)]
+        place([row[0] for row in rows], "d")
+        for row in rows:
+            place(row, "r")
+    finally:
+        # Clear any unconsumed preselection and bring back any staged windows
+        # if the compositor rejects a step or a window closes during the move.
+        subprocess.run(("hyprctl", "dispatch", 'hl.dsp.layout("preselect reset")'),
+                       stdout=subprocess.DEVNULL, check=False)
+        for address in addresses:
+            if address in pending:
+                try:
+                    move(address, target)
+                except (RuntimeError, subprocess.CalledProcessError):
+                    pass
+        if focused in addresses:
+            focus(focused)
+
+
+def main():
+    workspace = json.loads(hypr("-j", "activeworkspace"))
+    windows = sorted(
+        (window for window in json.loads(hypr("-j", "clients"))
+         if window["workspace"]["id"] == workspace["id"]
+         and window["mapped"] and not window["hidden"] and not window["pinned"]
+         and window["class"] != "local.omarchy.WindowOverview"
+         and re.fullmatch("0x[0-9a-f]+", window["address"])),
+        key=lambda window: (window["at"][1], window["at"][0]),
+    )
+    if workspace["hasfullscreen"]:
+        raise RuntimeError("Exit fullscreen before arranging the grid")
+    if windows:
+        tile(workspace, windows)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError) as error:
+        subprocess.run(("notify-send", "Tile windows", str(error)), check=False)
+        raise SystemExit(1) from error

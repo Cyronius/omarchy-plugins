@@ -27,21 +27,31 @@ Settings (in `~/.config/omarchy/shell.json`, or via `omarchy bar set cyrus.works
 
 To rename from a key binding, have it run `omarchy-shell cyrus.workspace-title toggle`.
 
-### window-grid
+### window-grid and window-overview
 
-A script that toggles the windows on the active workspace between an even grid and normal tiling. The grid is sized to the window count: 2 side by side, 3–4 in a 2x2, 5–6 in a 3x2, 7–9 in a 3x3. A short last row stretches to fill the width. Windows keep their reading order, and the gaps, borders and bar space match Hyprland's own tiling. Gridded windows are floated and tagged `grid`; running the script again puts them back into tiling.
+- **Super+Ctrl+G** switches the active workspace to Dwindle and arranges its windows in a grid of native Hyprland tiles. Four windows make a 2×2 grid. Drag shared borders to resize adjacent tiles together.
+- **Super+Ctrl+Shift+Tab** opens an overview of the current workspace with app icons and window titles. Click a card or use the arrow keys and Enter to focus it. Escape closes the overview.
+
+Both helpers need Python 3 and Hyprland 0.56 with Omarchy's Lua configuration. The overview also needs `python-gobject` and `gtk4`.
 
 ```bash
 ln -s ~/code/omarchy-plugins/window-grid/window-grid ~/.local/bin/window-grid
+ln -s ~/code/omarchy-plugins/window-overview/window-overview ~/.local/bin/window-overview
 ```
 
-Then bind it in `~/.config/hypr/bindings.lua`:
+Add these bindings to `~/.config/hypr/bindings.lua`. Replace any existing Super+Ctrl+G entry.
 
 ```lua
-o.bind("SUPER + CTRL + G", "Grid windows", os.getenv("HOME") .. "/.local/bin/window-grid")
+o.rebind("SUPER + CTRL + G", "Tile windows in a grid", os.getenv("HOME") .. "/.local/bin/window-grid")
+o.bind("SUPER + CTRL + SHIFT + TAB", "Workspace window overview", os.getenv("HOME") .. "/.local/bin/window-overview")
+hl.window_rule({
+  match = { class = "local[.]omarchy[.]WindowOverview" },
+  float = true,
+  center = true,
+})
 ```
 
-Needs `jq`.
+Run `hyprctl reload` and `hyprctl configerrors` after saving.
 
 ## Install
 

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Show and focus windows on the active Hyprland workspace."""
+
+import json
+import re
+import subprocess
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, Gtk, Pango
+
+
+def query(command):
+    return json.loads(subprocess.check_output(("hyprctl", "-j", command), text=True))
+
+
+def activate(app):
+    if existing := app.get_active_window():
+        existing.close()
+        return
+    workspace = query("activeworkspace")
+    windows = sorted(
+        (window for window in query("clients")
+         if window["workspace"]["id"] == workspace["id"] and window["mapped"]
+         and re.fullmatch("0x[0-9a-f]+", window["address"])),
+        key=lambda window: (window["hidden"], window["at"][1], window["at"][0]),
+    )
+    overview = Gtk.ApplicationWindow(application=app, title="Workspace windows")
+    overview.set_default_size(630, 180)
+    overview.set_resizable(False)
+
+    panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+    for edge in ("top", "bottom", "start", "end"):
+        getattr(panel, f"set_margin_{edge}")(18)
+    overview.set_child(panel)
+
+    heading = Gtk.Label(label=f'Workspace {workspace["name"]}', xalign=0)
+    heading.add_css_class("title-2")
+    panel.append(heading)
+
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    scroll.set_max_content_height(480)
+    scroll.set_propagate_natural_height(True)
+    panel.append(scroll)
+
+    grid = Gtk.Grid(column_spacing=10, row_spacing=10, column_homogeneous=True)
+    scroll.set_child(grid)
+    icons = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+    cards = []
+    selected = 0
+
+    def choose(_button, address):
+        overview.close()
+        subprocess.run(("hyprctl", "dispatch",
+                        f'hl.dsp.focus({{ window = "address:{address}" }})'),
+                       stdout=subprocess.DEVNULL, check=False)
+
+    for index, window in enumerate(windows):
+        address = window["address"]
+        app_name = window["class"] or window["initialClass"] or "Window"
+        title = window["title"] or app_name
+        icon_name = next((name for name in (app_name, app_name.lower()) if icons.has_icon(name)),
+                         "application-x-executable-symbolic")
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        icon.set_pixel_size(34)
+        label = Gtk.Label(label=title, ellipsize=Pango.EllipsizeMode.END, max_width_chars=21)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        content.append(icon)
+        content.append(label)
+        card = Gtk.Button(child=content, tooltip_text=f"{app_name}\n{title}")
+        card.set_size_request(185, 94)
+        card.connect("clicked", choose, address)
+        if address == workspace["lastwindow"]:
+            selected = index
+        cards.append(card)
+        grid.attach(card, index % 3, index // 3, 1, 1)
+
+    if not cards:
+        panel.append(Gtk.Label(label="No open windows", xalign=0))
+
+    def key_pressed(_controller, key, _code, _modifiers):
+        if key == Gdk.KEY_Escape:
+            overview.close()
+            return True
+        offsets = {Gdk.KEY_Left: -1, Gdk.KEY_Right: 1, Gdk.KEY_Up: -3, Gdk.KEY_Down: 3}
+        if key in offsets and cards:
+            current = next((i for i, card in enumerate(cards) if card.has_focus()), 0)
+            target = max(0, min(len(cards) - 1, current + offsets[key]))
+            cards[target].grab_focus()
+            return True
+        return False
+
+    keyboard = Gtk.EventControllerKey()
+    keyboard.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    keyboard.connect("key-pressed", key_pressed)
+    overview.add_controller(keyboard)
+    overview.present()
+    if cards:
+        cards[selected].grab_focus()
+
+
+app = Gtk.Application(application_id="local.omarchy.WindowOverview")
+app.connect("activate", activate)
+app.run()
